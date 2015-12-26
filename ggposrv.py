@@ -58,6 +58,7 @@ import tarfile
 import boto
 from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
 import urlparse
+from extensions.extension import Extension
 try:
 	import requests
 except:
@@ -74,6 +75,8 @@ VERSION=24
 MIN_CLIENT_VERSION=42
 
 DB_ENGINE="mysql"
+# DEBUG
+DB_ENGINE="sqlite3"
 
 if DB_ENGINE=="sqlite3":
 	import sqlite3
@@ -231,7 +234,7 @@ class GGPOHttpHandler(BaseHTTPRequestHandler):
 					except KeyError:
 						pass
 
-		res = json.dumps(out, indent=4, sort_keys=True);
+		res = json.dumps(out, indent=4, sort_keys=True)
 		self.wfile.write(res)
 
 	#Handler for the GET requests
@@ -330,6 +333,20 @@ def dbconnect():
 						duration INTEGER);""")
 			cursor.execute("""CREATE UNIQUE INDEX quarks_quark_idx on quarks (quark);""")
 			logging.info("created empty quark database")
+			cursor.execute("""CREATE TABLE IF NOT EXISTS extensionuserdata (
+					extid INTEGER,
+					name TEXT,
+					channel TEXT,
+					data BLOB,
+					PRIMARY KEY (extid, name, channel));""")
+			logging.info("created empty extension database")
+
+#			# DEBUG
+#			sql = "INSERT OR REPLACE INTO users (id, username, password, salt, email, ip, date) VALUES (?,?,?,?,?,?,?)"
+#			abc = "abcdefghijklmnopqrstuvwxyz"
+#			for i in range(26):
+#				cursor.execute(sql,[i, abc[i], abc[i], str(i), "asdf@asdf.com", "1.1.1.1", "2001-01-01 01:01:01"])
+
 			conn.commit()
 		return conn
 	elif DB_ENGINE=="mysql":
@@ -368,6 +385,11 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		self.send_queue = []		# Messages to send to client (strings)
 		self.channel = GGPOChannel("lobby",'', "The Lobby")	# Channel the client is in
 		self.challenging = {}		# users (GGPOClient instances) that this client is challenging by host
+		self.latitude = 0		# Client's lat/lon saved from IP lookup.  Not currently used, but added to facilitate
+		self.longitude = 0		#    future region-locking of tournaments etc.
+		self.color = 0x1000000  # Color which the user will appear as in a client player list.  3-byte RGB value, or 0x1000000 for default
+		self.os = 0             # Client's operating system.  1=Windows, 2=Linux, 3=OSX, 4=Unknown
+		self.utcoffset = 0		# Client's timezone given as utc offset in seconds
 
 		try:
 			set_keepalive_linux(request)
@@ -404,9 +426,9 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				if client_nick == nick:
 					return self.server.clients[nick]
 
-			for client_nick in self.channel.clients:
-				if client_nick == nick:
-					return self.channel.clients[nick]
+			for client in self.channel.clients:
+				if client.nick == nick:
+					return client
 		except KeyError:
 			pass
 
@@ -425,6 +447,8 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		iso_code=''
 		country=''
 		city=''
+		latitude=0
+		longitude=0
 		try:
 			response = reader.city(ip)
 
@@ -432,6 +456,10 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				iso_code=str(response.country.iso_code)
 			if response.country.name!=None:
 				country=str(response.country.name)
+			if response.location.latitude!=None:
+				latitude=response.location.latitude
+			if response.location.longitude!=None:
+				longitude=response.location.longitude
 			#if response.city.name!=None:
 				#city=str(response.city.name)
 
@@ -444,7 +472,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		except:
 			pass
 
-		return iso_code,country,city
+		return iso_code,country,city,latitude,longitude
 
 	def parse(self, data):
 
@@ -469,12 +497,18 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				nick=data[16:16+nicklen]
 				passwordlen=int(data[16+nicklen:16+nicklen+4].encode('hex'),16)
 				password=data[20+nicklen:20+nicklen+passwordlen]
-				port=int(data[20+nicklen+passwordlen:24+nicklen+passwordlen].encode('hex'),16)
-				if len(data) > 24+nicklen+passwordlen:
-					version=int(data[24+nicklen+passwordlen:28+nicklen+passwordlen].encode('hex'),16)
-				else:
-					version=0
-				params=nick,password,port,version,sequence
+				tmp = nicklen+passwordlen
+				port=int(data[tmp+20:tmp+24].encode('hex'),16)
+				version=int(data[tmp+24:tmp+28].encode('hex'),16)
+				operatingsystem=int(data[tmp+28:tmp+32].encode('hex'),16)
+				utcoffsetlen=int(data[tmp+32:tmp+36].encode('hex'),16)
+				utcoffset=int(data[tmp+36:tmp+36+utcoffsetlen])
+				utcoffset=utcoffset if utcoffset<24*60*60 else 24*60*60-utcoffset # offset is sent as (<one day> + |offset|) if negative.
+
+#				# DEBUG
+#				operatingsystem = random.randint(1, 2)
+
+				params=nick,password,port,version,operatingsystem,utcoffset,sequence
 
 			if (command==2):
 				if self.nick==None: return()
@@ -604,6 +638,13 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				nick=data[16:16+nicklen]
 				params = nick,sequence
 
+			if (command==0x1d):
+				if self.nick==None: return()
+				command = "extension_message"
+				cmdlinelen=int(data[12:16].encode('hex'),16)
+				cmdline = data[16:16+cmdlinelen]
+				params = cmdline,sequence
+
 			if command in ["join", "challenge", "decline", "cancel", "accept", "getnicks", "watch", "spectator"]:
 				logging.info('[%s] SEQUENCE: %d COMMAND: %s %s' % (self.client_ident(),sequence,command,params[0]))
 			elif command in ["savestate", "list", "users", "ggpotv"]:
@@ -630,6 +671,11 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			except Exception, e:
 				response = '[%s] ERROR (3) %s in command %s' % (self.client_ident(), repr(e), command)
 				logging.error('%s' % (response))
+
+				# DEBUG
+				import traceback
+				print(traceback.format_exc())
+
 				raise
 
 		if (len(data) > length+4 ):
@@ -841,6 +887,8 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				f=open(quarkfile, 'wb')
 				f.write(response)
 				f.close()
+
+		Extension.MatchStarting.emit(quarkobject)
 
 	def handle_savestate(self, params):
 		quark, block1, block2, gamebuf, sequence = params
@@ -1426,14 +1474,20 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 	def handle_watch(self, params):
 
 		nick, sequence = params
+		# The sequence parameter is used to distinguish user-initiated spectate requests from code-initiated requests.
+		# User-initiated requests will always have positive sequence #, code-initiated should have negative
 
 		client = self.get_client_from_nick(nick)
 
+		# Extensions may restrict the ability of others to spectate matches they control to prevent in-game lag spikes
+		extOkToSpectate = (sequence == -1) or Extension.canSpectate(self, nick, client.opponent)
+
 		# check that user is connected, in playing state (status=2) and in the same channel
-		if (client.status==2 and client.channel==self.channel and client.quark!=None):
+		if (client.status==2 and client.channel==self.channel and client.quark!=None) and extOkToSpectate:
 
 			# send ACK to the user who wants to watch the running match
-			self.send_ack(sequence)
+			if sequence >= 0:
+				self.send_ack(sequence)
 
 			# send the quark stream uri to the user who wants to watch
 			negseq=4294967290 #'\xff\xff\xff\xfa'
@@ -1445,7 +1499,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			response = self.reply(negseq,pdu)
 			logging.debug('to %s: %r' % (self.client_ident(), response))
 			self.send_queue.append(response)
-		else:
+		elif sequence >= 0:
 			# send the NOACK to the client
 			response = self.reply(sequence,'\x00\x00\x00\x0b')
 			logging.debug('[%s] watch NO_ACK: %r' % (self.client_ident(), response))
@@ -1527,6 +1581,13 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		logging.debug('to %s: %r' % (self.client_ident(), response))
 		self.send_queue.append(response)
 
+		Extension.ChannelJoin.emit(self.channel.name, self)
+
+	def handle_extension_message(self, params):
+		cmd, sequence = params
+		Extension.parseMessage(self, cmd)
+		self.send_ack(sequence)
+
 	def kick_client(self, sequence, error=6):
 		# auth unsuccessful
 		response = self.reply(sequence,self.pad2hex(error))
@@ -1538,7 +1599,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		"""
 		Handle the initial setting of the user's nickname
 		"""
-		nick,password,port,version,sequence = params
+		nick,password,port,version,operatingsystem,utcoffset,sequence = params
 
 		if replayonly:
 			self.finish()
@@ -1564,6 +1625,9 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			# compute the hashed password
 			h_password = hmac.new("GGPO-NG", password+salt[0], hashlib.sha512).hexdigest()
 
+#			# DEBUG
+#			h_password = password
+
 			sql = "SELECT COUNT(username) FROM users WHERE password=" + PARAM + " AND username=" + PARAM
 			cursor.execute(sql, [(h_password),(nick)])
 			result = cursor.fetchone()
@@ -1586,32 +1650,35 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				self.kick_client(sequence,8)
 				return()
 
-		# check for multiple connections from the same ip address
-		same_ip=0
-		clone_port=0
-		clients = dict(self.server.clients)
-		try:
-			for client_nick in clients:
-				if self.server.clients[client_nick].host[0]==self.host[0]:
-					same_ip+=1
-					clone_port=self.server.clients[client_nick].port
-		except KeyError:
-			pass
-		#logging.info("[%s] connections from host %s -> %d" % (self.client_ident(), self.host[0], same_ip))
-
-		if (same_ip >= 2) or (same_ip == 1 and clone_port!=port):
-			self.nick = nick
-			logging.info("[%s] too many connections from host %s" % (self.client_ident(), self.host[0]))
-			self.kick_client(sequence,9)
-			return()
+		# DEBUG
+		# # check for multiple connections from the same ip address
+		# same_ip=0
+		# clone_port=0
+		# clients = dict(self.server.clients)
+		# try:
+		# 	for client_nick in clients:
+		# 		if self.server.clients[client_nick].host[0]==self.host[0]:
+		# 			same_ip+=1
+		# 			clone_port=self.server.clients[client_nick].port
+		# except KeyError:
+		# 	pass
+		# #logging.info("[%s] connections from host %s -> %d" % (self.client_ident(), self.host[0], same_ip))
+        #
+		# if (same_ip >= 2) or (same_ip == 1 and clone_port!=port):
+		# 	self.nick = nick
+		# 	logging.info("[%s] too many connections from host %s" % (self.client_ident(), self.host[0]))
+		# 	self.kick_client(sequence,9)
+		# 	return()
 
 		logging.info("[%s] LOGIN OK. VERSION: %s NICK: %s" % (self.client_ident(), str(version), nick))
 		self.nick = nick
 		self.server.clients[nick] = self
 		self.port = port
 		self.clienttype="client"
-		self.cc, self.country, self.city = self.geolocate(self.host[0])
+		self.cc, self.country, self.city, self.latitude, self.longitude = self.geolocate(self.host[0])
 		self.version = version
+		self.os = operatingsystem
+		self.utcoffset = utcoffset
 		timestamp = time.time()
 		self.lastmsgtime = timestamp
 
@@ -1635,14 +1702,15 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			return
 		elif (status>=0 and status<2) or (status==2 and sequence==0):
 			self.status = status
-                        if (status!=2):
-                                self.previous_status = status
+			if (status!=2):
+				self.previous_status = status
 		else:
 			# do nothing if the user tries to set an invalid status
 			logging.info('[%s]: trying to set invalid status: %d , self.status=%d, sequence=%d, self.opponent=%s' % (self.client_ident(), status, self.status, sequence, self.opponent))
 			return
 
 		if self.clienttype=="client":
+			self.color = Extension.getPlayerColor(self)
 
 			negseq=4294967293 #'\xff\xff\xff\xfd'
 			pdu2=''
@@ -1661,6 +1729,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			pdu+=self.sizepad(self.cc)
 			pdu+=self.sizepad(self.country)
 			pdu+=self.pad2hex(self.port)
+			pdu+=self.pad2hex(self.color)
 			if (self.opponent!=None):
 				client = self.get_client_from_nick(self.opponent)
 				pdu2+='\x00\x00\x00\x01'
@@ -1691,6 +1760,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			pdu1+=self.sizepad(self.cc)
 			pdu1+=self.sizepad(self.country)
 			pdu1+=self.pad2hex(self.port)
+			pdu1+=self.pad2hex(self.color)
 
 			self_response = self.reply(negseq,pdu1+pdu2)
 			self.send_queue.append(self_response)
@@ -1702,6 +1772,8 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 				if client != self:
 					logging.debug('to %s: %r' % (client.client_ident(), response))
 					client.send_queue.append(response)
+
+			Extension.StatusChanged.emit(self.channel.name, self)
 
 
 	def handle_users(self, params):
@@ -1735,6 +1807,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			pdu+=self.sizepad(client.cc)
 			pdu+=self.sizepad(client.country)
 			pdu+=self.pad2hex(client.port)      # port
+			pdu+=self.pad2hex(client.color)
 
 			if (self.version >= 40):
 				spectators=0
@@ -1946,6 +2019,8 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 		if self in channel.clients:
 			channel.clients.remove(self)
 
+		Extension.ChannelLeaving.emit(self.channel.name, self)
+
 		# write the number of channel clients to /run/shm/ggposrv/${rom-name}.${port-number}.txt
 		chanfile = "/run/shm/ggposrv/"+str(channel.name)+"."+str(listen_port)+".txt"
 		if not os.path.exists(chanfile):
@@ -2102,6 +2177,13 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			motd+='-!- Game stats: http://www.fightcade.com/game/'+str(self.channel.name)+'\n'
 		motd+='-!- Replay browser: http://www.fightcade.com/replay\n'
 
+		# display scheduled tournaments if any
+		tmlist = Extension.scheduledTournaments(self.channel.name, self)
+		if len(tmlist) > 0:
+			motd += '\n Scheduled Tournaments (all times local)\n'
+			for nm, dt in tmlist:
+				motd += dt.ctime() + ' - ' + nm + '\n'
+
 		return motd
 
 	def handle_dump(self):
@@ -2151,6 +2233,8 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			# return the client to non-playing state when the emulator closes
 			myself=self.get_myclient_from_quark(self.quark)
 			logging.info("[%s] cleaning: %s" % (self.client_ident(), myself.client_ident()))
+
+			Extension.EmulatorClosed.emit(self.channel.name, myself)
 
 			myself.side=0
 			myself.opponent=None
@@ -2269,7 +2353,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 					logging.debug("[%s] killing peer connection: %s" % (self.client_ident(), quarkobject.p1.client_ident()))
 					quarkobject.p1.request.close()
 
-			except KeyError, AttributeError:
+			except (KeyError, AttributeError):
 				pass
 
 		if self.clienttype=="spectator":
@@ -2277,7 +2361,7 @@ class GGPOClient(SocketServer.BaseRequestHandler):
 			try:
 				logging.debug("[%s] spectator leaving quark %s" % (self.client_ident(), self.quark))
 				self.spectator_leave(self.quark)
-			except KeyError, AttributeError:
+			except (KeyError, AttributeError):
 				pass
 
 		if self.host in self.server.connections:
@@ -2528,6 +2612,8 @@ class GGPOServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
 		self.quarks = {} # quark games (GGPOQuark instances) by quark
 		SocketServer.TCPServer.__init__(self, server_address, RequestHandlerClass)
 
+		Extension.Initialize(self, dbconnect, DB_ENGINE, PARAM)
+
 class RendezvousUDPServer(SocketServer.ThreadingMixIn, SocketServer.UDPServer):
 	def __init__(self, server_address, MyUDPHandler):
 		self.quarkqueue = {}
@@ -2665,6 +2751,11 @@ if __name__ == "__main__":
 
 	(options, args) = parser.parse_args()
 
+#	# DEBUG
+#	options.verbose = True
+#	options.foreground = True
+#	options.log_stdout = True
+
 	holepunch=options.udpholepunch
 	replayonly=options.replay
 	nullauth=options.nullauth
@@ -2768,3 +2859,5 @@ if __name__ == "__main__":
 		sys.exit(-2)
 	except:
 		traceback.print_exc(file=open("ggposrv-errors.log","a"))
+#		# DEBUG
+#		raise

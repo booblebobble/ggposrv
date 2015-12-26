@@ -1,0 +1,42 @@
+# Tournament schedule file.
+#
+# This is read in on server startup or by entering '/tournaments reload' in a client while logged in as one of the users
+# in Extension._Admins.  Reloading will cancel any scheduled tournament that has not yet started and schedule all tournaments
+# below.
+#
+# Lines beginning with '#' are ignored
+
+
+# Username and API key of challonge account used to store brackets
+# The API key is found in the challonge settings in the Developer API tab
+username=fctmtest
+apikey=MuVK1igsLM2ZPdUiiWWjoNFgRYVQuyIHHVWbTtWl
+
+
+# Sample tournament entry format
+#[Sample Title]                 <-  Tournament title, in brackets, indicates the start of a schedule entry
+#channel=sfiii3n                <-  Channel tournament is to be held in
+
+#moderator=a                    <-  Moderators, one per line. Moderators can set scores of matches if there are conflicts.
+#moderator=b                    <-  If no moderators are listed, conflicts are decided randomly.
+
+#starttime=05-05-25 05:05       <-  Date and start time of tournament.  Registration will start 30 minutes before this time.
+#                               <-  Format is arbitrary as long as dateutil.parser.parse can interpret it correctly.
+#                               <-  Time is assumed to be UTC unless time zone is given.
+
+#period=7                       <-  Recurring time for tournament in days.  I.e. 7 = weekly tournament.  Use 0 for a one-time tournament.
+
+#rules=rules line 1             <-  Rules for the tournament, such as who's eligible or the number of games per match.  Displayed
+#rules=rules line 2             <-  when users click the 'Rules' button.
+#rules=rules line 3             <-  Not programatically enforced in any way.
+
+[Sample]
+channel=sfiii3n
+moderator=a
+moderator=b
+starttime=05-05-25 05:05
+period=7
+rules=rules line 1
+rules=rules line 2
+rules=rules line 3
+region='Murica
